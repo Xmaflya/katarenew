@@ -204,23 +204,19 @@ function parseExpiryDate(dateStr) {
     let normalized = String(dateStr).trim();
     let d = null;
 
-    // YYYY-MM-DD 或 YYYY/MM/DD
     let m = normalized.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
     if (m) d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
 
-    // DD MMM YYYY
     if (!d) {
         m = normalized.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
         if (m) d = new Date(`${m[1]} ${m[2]} ${m[3]}`);
     }
 
-    // MMM DD, YYYY
     if (!d) {
         m = normalized.match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$/);
         if (m) d = new Date(`${m[1]} ${m[2]} ${m[3]}`);
     }
 
-    // YYYY年MM月DD日
     if (!d) {
         m = normalized.match(/^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$/);
         if (m) d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
@@ -232,7 +228,7 @@ function parseExpiryDate(dateStr) {
     return Math.ceil((d.getTime() - Date.now()) / (1000 * 3600 * 24));
 }
 
-// --- 提取服务器页面状态（更宽松的日期匹配） ---
+// --- 提取服务器页面状态（针对详情页优化） ---
 async function extractServerStatus(page) {
     let bodyText = '';
     try {
@@ -243,26 +239,28 @@ async function extractServerStatus(page) {
 
     let actualExpiry = null;
 
-    // 策略1：Expiry 附近 250 字符内找日期
-    const expiryBlock = bodyText.match(/Expir(?:y|ation|e)[\s\S]{0,250}/i);
-    const searchText = expiryBlock ? expiryBlock[0] : bodyText;
-
-    const datePatterns = [
-        /\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/,
-        /\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b/,
-        /\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b/,
-        /\b(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\b/
-    ];
-
-    for (const p of datePatterns) {
-        const m = searchText.match(p);
-        if (m) { actualExpiry = m[0].trim(); break; }
-    }
-
-    if (!actualExpiry) {
+    // 精准匹配 "Expiry" 后面的日期，允许换行和空白
+    const expiryMatch = bodyText.match(/Expiry\s*[\n\r]*\s*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4})/i);
+    if (expiryMatch) {
+        actualExpiry = expiryMatch[1].trim();
+    } else {
+        // 兜底：在包含 "Expiry" 的段落附近找日期
+        const expiryBlock = bodyText.match(/Expiry[\s\S]{0,200}/i);
+        const searchText = expiryBlock ? expiryBlock[0] : bodyText;
+        const datePatterns = [
+            /\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/,
+            /\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b/,
+            /\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b/
+        ];
         for (const p of datePatterns) {
-            const m = bodyText.match(p);
+            const m = searchText.match(p);
             if (m) { actualExpiry = m[0].trim(); break; }
+        }
+        if (!actualExpiry) {
+            for (const p of datePatterns) {
+                const m = bodyText.match(p);
+                if (m) { actualExpiry = m[0].trim(); break; }
+            }
         }
     }
 
@@ -1179,7 +1177,6 @@ async function switchMihomoProxy(name) {
     }
 
     let renewDates = loadRenewDates();
-    // 【新增】启动时清理无效缓存（'已校正'、空值、无法解析的日期）
     let cleaned = false;
     for (const key of Object.keys(renewDates)) {
         if (!renewDates[key] || renewDates[key] === '已校正' || parseExpiryDate(renewDates[key]) === null) {
@@ -1356,27 +1353,66 @@ async function switchMihomoProxy(name) {
 
                 console.log(`   >> ✅ 登录成功，当前 URL: ${page.url()}`);
 
-                // 【核心改动】
-                // 不再直接 goto /servers/edit，而是：
-                // 1) 先回到 Dashboard，等页面完全渲染
-                // 2) 优先在当前 Dashboard 找 Renew 按钮（每个 server 一行，可能直接有 Renew）
-                // 3) 找不到就找 See 链接点进详情页，再找 Renew 按钮
-                // 4) 进入详情页后再读到期日
-
-                console.log('   >> 正在返回 Dashboard...');
+                // ============================================================
+                // 【核心修复】不再直接 goto /servers/edit?id=serverId，
+                // 而是先访问 Dashboard，找到对应服务器的 "See" 链接，点击进入详情页。
+                // ============================================================
+                console.log('   >> 正在访问 Dashboard...');
                 await page.goto('https://dashboard.katabump.com/dashboard', { waitUntil: 'domcontentloaded' });
                 await page.waitForTimeout(3000);
 
-                // 如果 user.serverId 存在，构造一个精确跳转到该服务器的 See 链接
-                let targetUrl = 'https://dashboard.katabump.com/dashboard';
-                if (user.serverId) {
-                    targetUrl = `https://dashboard.katabump.com/servers/edit?id=${user.serverId}`;
+                // 获取所有 "See" 链接
+                const seeLinks = await page.locator('a:has-text("See")').all();
+                console.log(`   >> 找到 ${seeLinks.length} 个 "See" 链接`);
+
+                if (seeLinks.length === 0) {
+                    console.log('   >> ⚠️ 未找到任何 "See" 链接，可能 Dashboard 结构变化或没有服务器。');
+                    accountFailureReason = "未找到服务器链接";
+                    continue;
                 }
 
-                console.log(`   >> 正在进入服务器页面: ${targetUrl}`);
-                await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-                await page.waitForTimeout(3000);
+                let enteredServerPage = false;
 
+                // 如果用户提供了 serverId（Identifier），则遍历查找匹配的服务器
+                if (user.serverId) {
+                    console.log(`   >> 用户提供了 serverId (Identifier): ${user.serverId}，正在查找匹配的服务器...`);
+                    for (let link of seeLinks) {
+                        const href = await link.getAttribute('href');
+                        if (!href) continue;
+                        console.log(`   >> 尝试进入: ${href}`);
+                        await page.goto(href, { waitUntil: 'domcontentloaded' });
+                        await page.waitForTimeout(2000);
+
+                        // 检查页面上的 Identifier 是否匹配
+                        const bodyText = await page.innerText('body').catch(() => '');
+                        // 详情页里 Identifier 通常显示为 "Identifier" 后面的值
+                        const identifierMatch = bodyText.match(/Identifier[\s\S]{0,50}?([a-f0-9]{8})/i);
+                        if (identifierMatch && identifierMatch[1].toLowerCase() === user.serverId.toLowerCase()) {
+                            console.log(`   >> ✅ 找到匹配的服务器: ${href}`);
+                            enteredServerPage = true;
+                            break;
+                        }
+                        // 如果页面文本里直接包含了 serverId，也算匹配
+                        if (bodyText.includes(user.serverId)) {
+                            console.log(`   >> ✅ 在页面文本中找到匹配 serverId: ${href}`);
+                            enteredServerPage = true;
+                            break;
+                        }
+                    }
+                    if (!enteredServerPage) {
+                        console.log(`   >> ⚠️ 未找到匹配 serverId 的服务器，将使用第一个服务器。`);
+                    }
+                }
+
+                // 如果没有匹配或用户未提供 serverId，使用第一个 "See" 链接
+                if (!enteredServerPage) {
+                    const firstHref = await seeLinks[0].getAttribute('href');
+                    console.log(`   >> 使用第一个服务器: ${firstHref}`);
+                    await page.goto(firstHref, { waitUntil: 'domcontentloaded' });
+                    await page.waitForTimeout(3000);
+                }
+
+                // 现在应该处于服务器详情页
                 // 如果被踢回登录，说明 cookie 丢失
                 if (page.url().includes('/auth/login')) {
                     console.log('   >> ❌ 访问服务器页被重定向回登录页，视为本次登录失效。');
@@ -1388,13 +1424,12 @@ async function switchMihomoProxy(name) {
                 if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                 const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
 
-                // 【调试】打印页面文本前 1500 字符，方便下次判断页面结构
+                // 调试输出
                 try {
                     const dbgText = await page.innerText('body');
                     console.log('   >> [调试] 当前页面文本前 1500 字符:\n' + dbgText.substring(0, 1500).replace(/\n{3,}/g, '\n\n'));
                 } catch (e) { }
 
-                // 保存一张当前页面截图，方便排查
                 try {
                     await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}_server_page.png`));
                     console.log(`   >> [调试] 已保存服务器页面截图: ${safeUsername}_server_page.png`);
@@ -1451,7 +1486,7 @@ async function switchMihomoProxy(name) {
 
                     console.log(`\n[尝试 ${attempt}/${RENEW_MAX_ATTEMPTS}] 正在寻找 Renew 按钮...`);
 
-                    // 【改进】Renew 按钮查找：先按 role，再按文本，最后按 class
+                    // Renew 按钮查找：先按 role，再按文本
                     let renewBtn = page.getByRole('button', { name: /^Renew$/i }).first();
                     if (!(await renewBtn.count())) {
                         renewBtn = page.getByRole('link', { name: /^Renew$/i }).first();
@@ -1535,12 +1570,7 @@ async function switchMihomoProxy(name) {
                                 try {
                                     await page.reload({ timeout: 10000, waitUntil: 'domcontentloaded' });
                                     await page.waitForTimeout(2000);
-                                } catch (reloadErr) {
-                                    if (user.serverId) {
-                                        await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { timeout: 15000, waitUntil: 'domcontentloaded' }).catch(() => { });
-                                        await page.waitForTimeout(2000);
-                                    }
-                                }
+                                } catch (reloadErr) { }
 
                                 const refreshedStatus = await extractServerStatus(page);
 
