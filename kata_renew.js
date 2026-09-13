@@ -41,82 +41,64 @@ function saveRenewDates(dates) {
 
 // --- 辅助函数：转义 Telegram Markdown v1 特殊字符 ---
 function escapeMarkdown(text) {
-    return text.replace(/([_*`\[])/g, '\\$1');
+    return String(text == null ? '' : text).replace(/([_*`\[])/g, '\\$1');
 }
 
-// --- 辅助函数：多格式智能用户提取 (支持 JSON数组、单双引号容错、多行文本、多种环境变量名) ---
-function getUsers() {
-    const rawUsers = (
-        process.env.USERS_JSON || 
-        process.env.USERS || 
-        process.env.KATA_USERS || 
-        process.env.ACCOUNTS || 
-        ''
-    ).trim();
+// --- 辅助函数：账号脱敏日志 ---
+function maskUsernameForLog(username) {
+    const value = String(username || '').trim();
+    if (!value) return '(empty)';
 
-    // 1. 如果环境变量为空，尝试从本地文件加载
-    if (!rawUsers) {
-        const localFiles = ['users.json', 'accounts.json', 'accounts.txt', 'users.txt'];
-        for (const file of localFiles) {
-            const fullPath = path.join(process.cwd(), file);
-            if (fs.existsSync(fullPath)) {
-                try {
-                    const content = fs.readFileSync(fullPath, 'utf8').trim();
-                    if (content) {
-                        console.log(`[用户配置] 从本地文件 ${file} 读取用户凭据...`);
-                        return parseUsersString(content);
-                    }
-                } catch (e) {}
-            }
-        }
-
-        // 尝试单账号环境变量
-        const singleUser = process.env.KATA_USERNAME || process.env.EMAIL || process.env.USERNAME_LOGIN;
-        const singlePass = process.env.KATA_PASSWORD || process.env.PASSWORD || process.env.PASS_LOGIN;
-        if (singleUser && singlePass) {
-            console.log('[用户配置] 从单账号环境变量读取到 1 个用户');
-            return [{
-                username: singleUser.trim(),
-                password: singlePass.trim(),
-                serverId: (process.env.SERVER_ID || '').trim() || undefined
-            }];
-        }
-
-        console.error('\n❌ [错误] 未能获取到用户配置！');
-        console.error('👉 请在 GitHub 仓库 -> Settings -> Secrets and variables -> Actions 中添加 Secret:');
-        console.error('   Name:  USERS_JSON');
-        console.error('   Value: [{"username": "your_email@example.com", "password": "your_password"}]\n');
-        return [];
+    const atIndex = value.indexOf('@');
+    if (atIndex <= 1) {
+        if (value.length <= 3) return `${value[0] || '*'}**`;
+        return `${value.slice(0, 1)}***${value.slice(-1)}`;
     }
 
-    return parseUsersString(rawUsers);
+    const name = value.slice(0, atIndex);
+    const domain = value.slice(atIndex + 1);
+    const maskedName = name.length <= 2 ? `${name[0] || '*'}*` : `${name.slice(0, 2)}***`;
+    return `${maskedName}@${domain}`;
 }
 
+// --- 辅助函数：把多格式文本解析为 [{username, password, serverId}] ---
 function parseUsersString(raw) {
+    if (!raw) return [];
+
     // 尝试 JSON 解析
     try {
-        let cleaned = raw;
+        let cleaned = raw.trim();
         // 修复单引号 JSON
         if (cleaned.startsWith("[") && cleaned.includes("'")) {
             cleaned = cleaned.replace(/'/g, '"');
         }
         const parsed = JSON.parse(cleaned);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-            return parsed.map(item => ({
-                username: (item.username || item.user || item.email || '').trim(),
-                password: (item.password || item.pass || '').trim(),
-                serverId: item.serverId || item.server_id || undefined
+
+        let arr = null;
+        if (Array.isArray(parsed)) {
+            arr = parsed;
+        } else if (parsed && Array.isArray(parsed.users)) {
+            arr = parsed.users;
+        } else if (parsed && typeof parsed === 'object' && (parsed.username || parsed.password)) {
+            arr = [parsed];
+        }
+
+        if (arr && arr.length > 0) {
+            return arr.map(item => ({
+                username: String(item.username || item.user || item.email || '').trim(),
+                password: String(item.password || item.pass || '').trim(),
+                serverId: String(item.serverId || item.server_id || '').trim() || undefined
             })).filter(u => u.username && u.password);
         }
-    } catch (e) {}
+    } catch (e) { }
 
-    // 尝试多行文本解析 (支持 user:pass / user----pass / user,pass)
+    // 尝试多行文本解析 (支持 user:pass / user----pass / user,pass / user:pass:serverId)
     const lines = raw.split(/\r?\n/);
     const users = [];
     for (let line of lines) {
         line = line.trim();
         if (!line || line.startsWith('#') || line.startsWith('//')) continue;
-        
+
         let parts = [];
         if (line.includes('----')) {
             parts = line.split('----');
@@ -135,6 +117,94 @@ function parseUsersString(raw) {
         }
     }
     return users;
+}
+
+// --- 辅助函数：校验、去重并写入 stats ---
+function finalizeUsers(rawUsers) {
+    const users = [];
+    const seenUsernames = new Set();
+
+    for (const entry of (rawUsers || [])) {
+        if (!entry || typeof entry !== 'object') {
+            console.log('[用户配置] 跳过无效条目: 非对象。');
+            continue;
+        }
+
+        const username = String(entry.username || entry.email || '').trim();
+        const password = String(entry.password || '').trim();
+        const serverId = String(entry.serverId || entry.server_id || '').trim();
+
+        if (!username || !password) {
+            console.log(`[用户配置] 跳过无效条目: username/password 不完整 (${maskUsernameForLog(username)})`);
+            continue;
+        }
+
+        const dedupeKey = username.toLowerCase();
+        if (seenUsernames.has(dedupeKey)) {
+            console.log(`[用户配置] 跳过重复账号: ${maskUsernameForLog(username)}`);
+            continue;
+        }
+
+        seenUsernames.add(dedupeKey);
+        users.push({ username, password, serverId: serverId || undefined });
+    }
+
+    console.log(`[用户配置] 原始条目 ${rawUsers ? rawUsers.length : 0}，有效用户 ${users.length}`);
+    if (users.length > 0) {
+        console.log(`[用户配置] 本次执行账号: ${users.map((u) => maskUsernameForLog(u.username)).join(', ')}`);
+    }
+
+    stats.total = users.length;
+    return users;
+}
+
+// --- 统一 getUsers（合并了原脚本里重复定义的两个版本） ---
+function getUsers() {
+    const rawUsers = (
+        process.env.USERS_JSON ||
+        process.env.USERS ||
+        process.env.KATA_USERS ||
+        process.env.ACCOUNTS ||
+        ''
+    ).trim();
+
+    // 1. 环境变量为空时，尝试从本地文件加载
+    if (!rawUsers) {
+        const localFiles = ['users.json', 'accounts.json', 'accounts.txt', 'users.txt'];
+        for (const file of localFiles) {
+            const fullPath = path.join(process.cwd(), file);
+            if (fs.existsSync(fullPath)) {
+                try {
+                    const content = fs.readFileSync(fullPath, 'utf8').trim();
+                    if (content) {
+                        console.log(`[用户配置] 从本地文件 ${file} 读取用户凭据...`);
+                        return finalizeUsers(parseUsersString(content));
+                    }
+                } catch (e) { }
+            }
+        }
+
+        // 2. 尝试单账号环境变量
+        const singleUser = process.env.KATA_USERNAME || process.env.EMAIL || process.env.USERNAME_LOGIN;
+        const singlePass = process.env.KATA_PASSWORD || process.env.PASSWORD || process.env.PASS_LOGIN;
+        if (singleUser && singlePass) {
+            console.log('[用户配置] 从单账号环境变量读取到 1 个用户');
+            return finalizeUsers([{
+                username: singleUser.trim(),
+                password: singlePass.trim(),
+                serverId: (process.env.SERVER_ID || '').trim() || undefined
+            }]);
+        }
+
+        console.error('\n❌ [错误] 未能获取到用户配置！');
+        console.error('👉 请在 GitHub 仓库 -> Settings -> Secrets and variables -> Actions 中添加 Secret:');
+        console.error('   Name:  USERS_JSON');
+        console.error('   Value: [{"username": "your_email@example.com", "password": "your_password"}]\n');
+        stats.total = 0;
+        return [];
+    }
+
+    return finalizeUsers(parseUsersString(rawUsers));
 }
 
 // --- 辅助函数：解析到期时间 ---
@@ -156,7 +226,7 @@ function parseExpiryDate(dateStr) {
             }
         }
     }
-    
+
     if (nextD && !isNaN(nextD.getTime())) {
         return Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
     }
@@ -238,7 +308,11 @@ process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 // 统一代理变量（兼容 SUB_URL / PROXY_URL / S5_URL / HTTP_PROXY，单变量智能解析）
 const PROXY_SOURCE = (process.env.SUB_URL || process.env.PROXY_URL || process.env.S5_URL || process.env.HTTP_PROXY || '').trim();
+const SUB_URL = process.env.SUB_URL || '';
 let PROXY_CONFIG = null;
+
+// 【修复】全局声明 Mihomo 开关，避免未定义导致 ReferenceError
+let IS_MIHOMO_ENABLED = false;
 
 // --- 注入脚本：Hook Shadow DOM 获取 Turnstile 坐标 ---
 const INJECTED_SCRIPT = `
@@ -337,7 +411,7 @@ function killExistingChrome() {
             execSync(`pkill -9 -f "remote-debugging-port=${DEBUG_PORT}" || true`, { stdio: 'ignore' });
             execSync(`pkill -9 -f chrome || true`, { stdio: 'ignore' });
         }
-    } catch (e) {}
+    } catch (e) { }
 }
 
 function resolveChromeExecutable() {
@@ -348,7 +422,7 @@ function resolveChromeExecutable() {
         const pw = require('playwright');
         const pwPath = pw.chromium.executablePath();
         if (pwPath && fs.existsSync(pwPath)) return pwPath;
-    } catch (e) {}
+    } catch (e) { }
 
     const candidates = [
         '/usr/bin/google-chrome',
@@ -384,7 +458,7 @@ async function launchChrome(maxRetries = 3) {
 
         const tempBase = process.platform === 'win32' ? (process.env.TEMP || 'C:\\Temp') : '/tmp';
         const userDataDir = path.join(tempBase, `chrome_profile_${Date.now()}_${attempt}`);
-        try { fs.mkdirSync(userDataDir, { recursive: true }); } catch (e) {}
+        try { fs.mkdirSync(userDataDir, { recursive: true }); } catch (e) { }
 
         const args = [
             `--remote-debugging-port=${DEBUG_PORT}`,
@@ -438,7 +512,7 @@ async function launchChrome(maxRetries = 3) {
                 const errLog = fs.readFileSync(errLogPath, 'utf8');
                 if (errLog.trim()) console.error('[Chrome] 启动错误日志:\n', errLog.trim());
             }
-        } catch (e) {}
+        } catch (e) { }
 
         if (attempt < maxRetries) {
             console.log('[Chrome] 等待 3 秒后重试启动...');
@@ -460,78 +534,6 @@ async function configurePageViewport(page) {
 
 async function saveViewportScreenshot(page, imagePath) {
     await page.screenshot({ path: imagePath, fullPage: true });
-}
-
-function maskUsernameForLog(username) {
-    const value = String(username || '').trim();
-    if (!value) return '(empty)';
-
-    const atIndex = value.indexOf('@');
-    if (atIndex <= 1) {
-        if (value.length <= 3) return `${value[0] || '*'}**`;
-        return `${value.slice(0, 1)}***${value.slice(-1)}`;
-    }
-
-    const name = value.slice(0, atIndex);
-    const domain = value.slice(atIndex + 1);
-    const maskedName = name.length <= 2 ? `${name[0] || '*'}*` : `${name.slice(0, 2)}***`;
-    return `${maskedName}@${domain}`;
-}
-
-function getUsers() {
-    try {
-        if (process.env.USERS_JSON) {
-            const parsed = JSON.parse(process.env.USERS_JSON);
-            let rawUsers = [];
-
-            if (Array.isArray(parsed)) {
-                rawUsers = parsed;
-            } else if (parsed && Array.isArray(parsed.users)) {
-                rawUsers = parsed.users;
-            } else if (parsed && typeof parsed === 'object' && (parsed.username || parsed.password)) {
-                rawUsers = [parsed];
-            }
-
-            const users = [];
-            const seenUsernames = new Set();
-
-            for (const entry of rawUsers) {
-                if (!entry || typeof entry !== 'object') {
-                    console.log('[用户配置] 跳过无效条目: 非对象。');
-                    continue;
-                }
-
-                const username = String(entry.username || entry.email || '').trim();
-                const password = String(entry.password || '').trim();
-                const serverId = String(entry.serverId || '').trim();
-
-                if (!username || !password) {
-                    console.log(`[用户配置] 跳过无效条目: username/password 不完整 (${maskUsernameForLog(username)})`);
-                    continue;
-                }
-
-                const dedupeKey = username.toLowerCase();
-                if (seenUsernames.has(dedupeKey)) {
-                    console.log(`[用户配置] 跳过重复账号: ${maskUsernameForLog(username)}`);
-                    continue;
-                }
-
-                seenUsernames.add(dedupeKey);
-                users.push({ username, password, serverId });
-            }
-
-            console.log(`[用户配置] USERS_JSON 原始条目 ${rawUsers.length}，有效用户 ${users.length}`);
-            if (users.length > 0) {
-                console.log(`[用户配置] 本次执行账号: ${users.map((user) => maskUsernameForLog(user.username)).join(', ')}`);
-            }
-
-            stats.total = users.length;
-            return users;
-        }
-    } catch (e) {
-        console.error('解析 USERS_JSON 环境变量错误:', e);
-    }
-    return [];
 }
 
 // --- 核心辅助：通过 CDP 派发鼠标点击事件 ---
@@ -559,7 +561,7 @@ async function dispatchCdpClick(page, x, y) {
         console.log('>> CDP 点击失败:', e.message);
         return false;
     } finally {
-        await client.detach().catch(() => {});
+        await client.detach().catch(() => { });
     }
 }
 
@@ -573,7 +575,7 @@ async function attemptTurnstileCdp(page) {
             const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
             if (data) {
                 console.log('>> 发现 Turnstile 数据。比例:', data);
-                await frame.evaluate(() => { window.__turnstile_data = null; }).catch(() => {});
+                await frame.evaluate(() => { window.__turnstile_data = null; }).catch(() => { });
                 const iframeElement = await frame.frameElement();
                 if (!iframeElement) continue;
                 const box = await iframeElement.boundingBox();
@@ -647,7 +649,6 @@ async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts =
     console.log(`[${stageName}] 检测到 Turnstile，但未能通过验证。`);
     return false;
 }
-
 
 // ==========================================
 // ========== 2. ALTCHA 专区 (Renew用) =========
@@ -738,7 +739,7 @@ async function attemptAltchaClick(page, currentStatus = null) {
             }
 
             await page.waitForTimeout(500);
-            await altchaWidget.scrollIntoViewIfNeeded().catch(() => {});
+            await altchaWidget.scrollIntoViewIfNeeded().catch(() => { });
 
             let boxInfo = await page.evaluate(() => {
                 const widget = document.querySelector('altcha-widget');
@@ -969,7 +970,7 @@ function parseS5TextToMihomoProxies(rawText) {
                     currentLabel = '';
                     continue;
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 2. 标准 socks5:// 协议格式: socks5://user:pass@server:port
@@ -996,7 +997,7 @@ function parseS5TextToMihomoProxies(rawText) {
                     currentLabel = '';
                     continue;
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 3. HTTP 格式 (支持附带 | 备注): http://114.37.235.105:443 | 家宽直连
@@ -1031,7 +1032,7 @@ function parseS5TextToMihomoProxies(rawText) {
                     currentLabel = '';
                     continue;
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 4. IP:Port:User:Pass 或 IP:Port 纯文本格式
@@ -1169,7 +1170,7 @@ rules:
             IS_MIHOMO_ENABLED = true;
             await new Promise(r => setTimeout(r, 5000));
             console.log('[智能代理] 正在刷新 provider 节点...');
-            await axios.put('http://127.0.0.1:9090/providers/proxies/sub1').catch(()=>{});
+            await axios.put('http://127.0.0.1:9090/providers/proxies/sub1').catch(() => { });
             await new Promise(r => setTimeout(r, 2000));
             const proxies = await getMihomoProxies();
             if (proxies.length > 0) {
@@ -1197,7 +1198,7 @@ rules:
             if (decoded && (decoded.includes('://') || decoded.includes('server='))) {
                 textToParse = decoded;
             }
-        } catch (e) {}
+        } catch (e) { }
 
         parsedProxies = parseS5TextToMihomoProxies(textToParse);
     }
@@ -1263,11 +1264,11 @@ async function getMihomoProxies() {
             const res = await axios.get('http://127.0.0.1:9090/proxies/MyGroup');
             const all = res.data.all || [];
             const filtered = all.filter(name => name !== 'DIRECT' && name !== 'REJECT' && name !== 'MyGroup');
-            
+
             if (filtered.length > 0) {
                 return filtered;
             }
-            
+
             console.log(`[代理池] 尝试 ${attempt}: 节点数为0，等待 3 秒后重试...`);
             await new Promise(r => setTimeout(r, 3000));
         } catch (e) {
@@ -1275,20 +1276,20 @@ async function getMihomoProxies() {
             await new Promise(r => setTimeout(r, 3000));
         }
     }
-    
+
     console.error('[代理池] 警告：多次尝试后提取到的节点数依然为0！');
     if (fs.existsSync(path.join(process.cwd(), 'sub1.yaml'))) {
         try {
             const subContent = fs.readFileSync(path.join(process.cwd(), 'sub1.yaml'), 'utf8');
             console.error('[代理池] sub1.yaml 下载内容前 500 字符:\n', subContent.substring(0, 500));
-        } catch(e) {}
+        } catch (e) { }
     }
-    
+
     try {
         const logContent = fs.readFileSync(path.join(process.cwd(), 'mihomo.log'), 'utf8');
         console.error('[代理池] Mihomo 运行日志:\n', logContent);
-    } catch (err) {}
-    
+    } catch (err) { }
+
     return [];
 }
 
@@ -1306,7 +1307,7 @@ async function testMihomoProxies(proxyNames) {
                     console.log(`   ├─ ✅ [健康可用] ${name.padEnd(25, ' ')} 延迟: ${res.data.delay}ms`);
                     return { name, delay: res.data.delay };
                 }
-            } catch (e) {}
+            } catch (e) { }
             console.log(`   ├─ ❌ [连接超时/失效] ${name}`);
             invalidNodes.push(name);
             return null;
@@ -1356,14 +1357,6 @@ async function switchMihomoProxy(name) {
         const smartResult = await setupSmartProxyPool(PROXY_SOURCE);
         proxyPool = smartResult.pool;
         proxyStats = smartResult.stats;
-    }
-
-    if (proxyStats.source !== 'NONE') {
-        if (proxyPool.length === 0) {
-            console.log('[代理池] ⚠️ 警告：健康检查后未发现可用节点，将降级使用默认网络。');
-        } else {
-            console.log(`[代理池] 🚀 健康节点池已建立 (共 ${proxyPool.length} 个有效节点)，每个账号及其重试将依次轮换使用不同有效节点！\n`);
-        }
     }
 
     if (proxyStats.source !== 'NONE') {
@@ -1430,25 +1423,22 @@ async function switchMihomoProxy(name) {
     const dummyPage = await context.newPage();
     for (const p of context.pages()) {
         if (p !== dummyPage) {
-            await p.close().catch(()=>{});
+            await p.close().catch(() => { });
         }
     }
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
-        
+
         const dedupeKey = user.username.toLowerCase();
-        // 【改造】移除最外层本地缓存盲跳逻辑：
-        // 必须每个账号都真实登录并进入服务器详情页，亲眼读取页面上真实的 Expiry 日期！
-        // 并在页面上对比校准本地记录，杜绝因本地假数据导致漏签漏查。
 
         let accountSuccess = false;
         let accountFailureReason = "未知错误";
         const maxAttempts = (proxyPool.length > 1) ? 5 : 3;
         let page = null;
         let usedNode = 'DIRECT';
-        
+
         for (let accountAttempt = 1; accountAttempt <= maxAttempts; accountAttempt++) {
             if (proxyPool.length > 0) {
                 const nodeName = proxyPool[proxyIndex % proxyPool.length];
@@ -1465,7 +1455,7 @@ async function switchMihomoProxy(name) {
 
             try {
                 if (page && !page.isClosed()) {
-                    await page.close().catch(()=>{});
+                    await page.close().catch(() => { });
                 }
                 await context.clearCookies();
                 page = await context.newPage();
@@ -1476,7 +1466,7 @@ async function switchMihomoProxy(name) {
                 console.log('正在访问登录页...');
                 await page.goto('https://dashboard.katabump.com/auth/login');
                 await page.waitForTimeout(2000);
-                
+
                 const loginTurnstileOk = await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
                 if (!loginTurnstileOk) {
                     console.log('   >> 登录阶段 Turnstile 验证失败，切换节点重试');
@@ -1488,10 +1478,10 @@ async function switchMihomoProxy(name) {
                 const emailInput = page.getByRole('textbox', { name: 'Email' });
                 await emailInput.waitFor({ state: 'visible', timeout: 5000 });
                 await emailInput.fill(user.username);
-                
+
                 const pwdInput = page.getByRole('textbox', { name: 'Password' });
                 await pwdInput.fill(user.password);
-                
+
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
@@ -1503,7 +1493,7 @@ async function switchMihomoProxy(name) {
                         if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
                         const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
                         const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
-                        try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+                        try { await saveViewportScreenshot(page, failScreenshot); } catch (e) { }
                         await sendTelegramMessage(`❌ *[@s5gydl] ${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
                         stats.failed++;
                         stats.failedAccounts.push(user.username);
@@ -1563,9 +1553,9 @@ async function switchMihomoProxy(name) {
                 if (serverStatus.isNotTimeToRenew) {
                     let daysLeft = parseExpiryDate(pageActualExpiry) || '未知';
                     console.log(`[未到期提示] 页面已明确提示未到续期时间。下次可续期: ${serverStatus.nextAvailableNotice || '未知'}`);
-                    
+
                     const statusScreenshot = path.join(photoDir, `${safeUsername}_status.png`);
-                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) {}
+                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) { }
 
                     let nextNoticeText = serverStatus.nextAvailableNotice ? `\n⏳ 下次可续期: \`${serverStatus.nextAvailableNotice}\`` : '';
                     await sendTelegramMessage(
@@ -1594,7 +1584,7 @@ async function switchMihomoProxy(name) {
 
                     console.log(`\n[尝试 ${attempt}/${RENEW_MAX_ATTEMPTS}] 正在寻找 Renew 按钮...`);
                     const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-                    
+
                     try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
 
                     if (await renewBtn.isVisible()) {
@@ -1617,7 +1607,7 @@ async function switchMihomoProxy(name) {
                             confirmBtn = modal.locator('button:has-text("Renew")').last();
                         }
                         if (await confirmBtn.isVisible()) {
-                            
+
                             const captchaScreenshotName = `${safeUsername}_modal_${attempt}.png`;
                             try {
                                 await saveViewportScreenshot(page, path.join(photoDir, captchaScreenshotName));
@@ -1639,7 +1629,7 @@ async function switchMihomoProxy(name) {
                                 let curExpiry = afterClickStatus.actualExpiry || pageActualExpiry;
                                 let daysLeft = parseExpiryDate(curExpiry) || '未知';
                                 console.log(`   >> ⏳ 暂无法续期 (时间未到)。下次可续期: ${afterClickStatus.nextAvailableNotice || '未知'}`);
-                                
+
                                 if (curExpiry) {
                                     if (renewDates[dedupeKey] !== curExpiry) {
                                         console.log(`[日期矫正] 重新写入本地记录: ${curExpiry}`);
@@ -1649,7 +1639,7 @@ async function switchMihomoProxy(name) {
                                 }
 
                                 const statusScreenshot = path.join(photoDir, `${safeUsername}_status.png`);
-                                try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) {}
+                                try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) { }
 
                                 let nextNoticeText = afterClickStatus.nextAvailableNotice ? `\n⏳ 下次可续期: \`${afterClickStatus.nextAvailableNotice}\`` : '';
                                 await sendTelegramMessage(
@@ -1686,7 +1676,7 @@ async function switchMihomoProxy(name) {
                                     await page.waitForTimeout(2000);
                                 } catch (reloadErr) {
                                     if (user.serverId) {
-                                        await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { timeout: 15000 }).catch(() => {});
+                                        await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { timeout: 15000 }).catch(() => { });
                                         await page.waitForTimeout(2000);
                                     }
                                 }
@@ -1698,14 +1688,14 @@ async function switchMihomoProxy(name) {
                                     let curExpiry = refreshedStatus.actualExpiry || pageActualExpiry;
                                     let daysLeft = parseExpiryDate(curExpiry) || '未知';
                                     console.log(`   >> ⏳ 刷新后发现未到续期时间。下次可续期: ${refreshedStatus.nextAvailableNotice || '未知'}`);
-                                    
+
                                     if (curExpiry) {
                                         renewDates[dedupeKey] = curExpiry;
                                         saveRenewDates(renewDates);
                                     }
 
                                     const statusScreenshot = path.join(photoDir, `${safeUsername}_status.png`);
-                                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) {}
+                                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) { }
 
                                     let nextNoticeText = refreshedStatus.nextAvailableNotice ? `\n⏳ 下次可续期: \`${refreshedStatus.nextAvailableNotice}\`` : '';
                                     await sendTelegramMessage(
@@ -1731,12 +1721,12 @@ async function switchMihomoProxy(name) {
                                 if (isDateExtended) {
                                     console.log(`   >> ✅ 续期成功！有效期从 ${pageActualExpiry} 更新至 ${newExpiry}`);
                                     let accurateDays = parseExpiryDate(newExpiry) || '约30';
-                                    
+
                                     renewDates[dedupeKey] = newExpiry;
                                     saveRenewDates(renewDates);
 
                                     const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
-                                    try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
+                                    try { await saveViewportScreenshot(page, successScreenshot); } catch (e) { }
                                     await sendTelegramMessage(
                                         `✅ *[@s5gydl] ${escapeMarkdown(user.username)}*\n续期成功！\n📅 有效期更新至: \`${newExpiry}\` (还剩 ${accurateDays} 天)`,
                                         successScreenshot
@@ -1756,14 +1746,14 @@ async function switchMihomoProxy(name) {
                                     let curExpiry = newExpiry || pageActualExpiry || '已校正';
                                     let daysLeft = parseExpiryDate(curExpiry) || '未知';
                                     console.log(`   >> 🔄 日期无需更新或未发生变动 (${curExpiry})，完成校对并同步本地文件`);
-                                    
+
                                     if (newExpiry) {
                                         renewDates[dedupeKey] = newExpiry;
                                         saveRenewDates(renewDates);
                                     }
 
                                     const statusScreenshot = path.join(photoDir, `${safeUsername}_status.png`);
-                                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) {}
+                                    try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) { }
                                     await sendTelegramMessage(
                                         `🔄 *[@s5gydl] ${escapeMarkdown(user.username)}*\n校正日期成功 (未到续期时间)\n📅 实际有效期: \`${curExpiry}\` (还剩 ${daysLeft} 天)`,
                                         statusScreenshot
@@ -1801,7 +1791,7 @@ async function switchMihomoProxy(name) {
                             saveRenewDates(renewDates);
                         }
                         const statusScreenshot = path.join(photoDir, `${safeUsername}_status.png`);
-                        try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) {}
+                        try { await saveViewportScreenshot(page, statusScreenshot); } catch (e) { }
                         await sendTelegramMessage(
                             `🔄 *[@s5gydl] ${escapeMarkdown(user.username)}*\n校正日期成功\n📅 实际有效期: \`${curExpiry}\` (还剩 ${daysLeft} 天)`,
                             statusScreenshot
@@ -1816,11 +1806,11 @@ async function switchMihomoProxy(name) {
                         renewPhaseSuccess = true;
                         break;
                     }
-                } 
+                }
 
                 if (renewPhaseSuccess) {
                     accountSuccess = true;
-                    break; 
+                    break;
                 } else {
                     accountFailureReason = `续期操作未成功完成`;
                     // Let the account retry loop continue and switch node
@@ -1839,7 +1829,7 @@ async function switchMihomoProxy(name) {
             const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
             const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
             if (page && !page.isClosed()) {
-                try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+                try { await saveViewportScreenshot(page, failScreenshot); } catch (e) { }
             }
             await sendTelegramMessage(`❌ *[@s5gydl] ${escapeMarkdown(user.username)}*\n${accountFailureReason} (已重试 ${maxAttempts} 次)`, failScreenshot);
             stats.failed++;
@@ -1851,20 +1841,20 @@ async function switchMihomoProxy(name) {
                 node: usedNode
             };
         }
-        
+
         if (page && !page.isClosed()) {
             const photoDir = path.join(process.cwd(), 'screenshots');
             if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
             const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-            try { await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}.png`)); } catch (e) {}
-            await page.close().catch(()=>{});
+            try { await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}.png`)); } catch (e) { }
+            await page.close().catch(() => { });
         }
-    } // <-- Missing closing brace for the users loop added here
+    }
 
     // --- 发送最终汇总报告 ---
     let summaryMessage = `📊 *续期任务汇总报告*\n`;
     summaryMessage += `📢 来源群组: @s5gydl\n\n`;
-    
+
     if (proxyStats.source !== 'NONE') {
         summaryMessage += `🌐 *节点池状态* (${proxyStats.source}):\n`;
         summaryMessage += `- 📥 提取总数: ${proxyStats.total}\n`;
@@ -1884,23 +1874,23 @@ async function switchMihomoProxy(name) {
     summaryMessage += `✅ 成功续期: ${stats.success}\n`;
     summaryMessage += `🔄 矫正/未到期: ${stats.skipped}\n`;
     summaryMessage += `❌ 失败数量: ${stats.failed}\n\n`;
-    
+
     summaryMessage += `📅 *账号详细信息*:\n`;
     users.forEach(user => {
         let info = accountDatesInfo[user.username];
         if (!info) {
-             info = { status: "未知", nextDate: "未知", daysLeft: "未知", node: "未知" };
-             let rd = renewDates[user.username.toLowerCase()];
-             if (rd) {
-                 info.status = "⏳ 之前已成功";
-                 info.nextDate = rd;
-                 let parsedDays = parseExpiryDate(rd);
-                 if (parsedDays !== null) {
-                     info.daysLeft = parsedDays;
-                 }
-             }
+            info = { status: "未知", nextDate: "未知", daysLeft: "未知", node: "未知" };
+            let rd = renewDates[user.username.toLowerCase()];
+            if (rd) {
+                info.status = "⏳ 之前已成功";
+                info.nextDate = rd;
+                let parsedDays = parseExpiryDate(rd);
+                if (parsedDays !== null) {
+                    info.daysLeft = parsedDays;
+                }
+            }
         }
-        
+
         summaryMessage += `\n👤 \`${escapeMarkdown(user.username)}\`\n`;
         summaryMessage += ` ├ 状态: ${info.status}\n`;
         summaryMessage += ` ├ 节点: \`${escapeMarkdown(info.node)}\`\n`;
@@ -1913,7 +1903,7 @@ async function switchMihomoProxy(name) {
             summaryMessage += `- \`${escapeMarkdown(acc)}\`\n`;
         });
     }
-    
+
     await sendTelegramMessage(summaryMessage);
 
     console.log('完成。');
