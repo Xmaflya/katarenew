@@ -13,10 +13,10 @@ jobs:
       contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    
+
     steps:
     - uses: actions/checkout@v5
-    
+
     - name: Setup Node.js
       uses: actions/setup-node@v5
       with:
@@ -29,6 +29,8 @@ jobs:
       with:
         path: node_modules
         key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
 
     - name: Cache Playwright
       id: cache-playwright
@@ -36,6 +38,8 @@ jobs:
       with:
         path: ~/.cache/ms-playwright
         key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-playwright-
 
     - name: Install Dependencies
       run: |
@@ -46,12 +50,12 @@ jobs:
           echo "⚡ 命中 Node Modules 缓存，跳过 npm install"
         fi
         if [ "${{ steps.cache-playwright.outputs.cache-hit }}" != "true" ]; then
-          echo "🌐 未命中缓存，安装 Playwright 系统环境依赖..."
-          npx playwright install-deps chrome
+          echo "🌐 未命中缓存，安装 Playwright 浏览器与系统依赖..."
+          npx playwright install --with-deps chromium
         else
-          echo "⚡ 命中 Playwright 依赖缓存，跳过重复下载"
+          echo "⚡ 命中 Playwright 缓存，跳过重复下载"
         fi
-      
+
     - name: Run Renew Script
       env:
         # 将 USERS_JSON 配置在 GitHub Repository Secrets 中
@@ -74,8 +78,21 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add renew_dates.json || true
-        git diff --cached --quiet renew_dates.json || git commit -m "chore: update renew dates [skip ci]"
+
+        if [ ! -f renew_dates.json ]; then
+          echo "renew_dates.json 不存在，跳过提交"
+          exit 0
+        fi
+
+        git add renew_dates.json
+
+        if git diff --cached --quiet -- renew_dates.json; then
+          echo "renew_dates.json 无变化，跳过提交"
+          exit 0
+        fi
+
+        git commit -m "chore: update renew dates [skip ci]"
+
         for i in {1..5}; do
           git pull --rebase --autostash || true
           if git push; then
@@ -91,3 +108,4 @@ jobs:
       with:
         name: screenshots
         path: screenshots/
+        if-no-files-found: ignore
