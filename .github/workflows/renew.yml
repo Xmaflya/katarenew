@@ -21,14 +21,14 @@ jobs:
       uses: actions/setup-node@v5
       with:
         node-version: '22'
-        cache: 'npm'
+        # 注意：这里不要写 cache: 'npm'，否则仓库里没有 package-lock.json 会直接失败
 
     - name: Cache Node Modules
       id: cache-npm
       uses: actions/cache@v4
       with:
         path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json', 'package.json') }}
         restore-keys: |
           ${{ runner.os }}-node-
 
@@ -37,7 +37,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/ms-playwright
-        key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+        key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json', 'package.json') }}
         restore-keys: |
           ${{ runner.os }}-playwright-
 
