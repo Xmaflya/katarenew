@@ -158,7 +158,7 @@ function finalizeUsers(rawUsers) {
     return users;
 }
 
-// --- 统一 getUsers（合并了原脚本里重复定义的两个版本） ---
+// --- 统一 getUsers ---
 function getUsers() {
     const rawUsers = (
         process.env.USERS_JSON ||
@@ -299,7 +299,6 @@ async function sendTelegramMessage(message, imagePath = null) {
 
 chromium.use(stealth);
 
-const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
@@ -311,7 +310,7 @@ const PROXY_SOURCE = (process.env.SUB_URL || process.env.PROXY_URL || process.en
 const SUB_URL = process.env.SUB_URL || '';
 let PROXY_CONFIG = null;
 
-// 【修复】全局声明 Mihomo 开关，避免未定义导致 ReferenceError
+// 全局声明 Mihomo 开关，避免未定义导致 ReferenceError
 let IS_MIHOMO_ENABLED = false;
 
 // --- 注入脚本：Hook Shadow DOM 获取 Turnstile 坐标 ---
@@ -360,33 +359,6 @@ const INJECTED_SCRIPT = `
     }
 })();
 `;
-
-async function checkProxy() {
-    if (!PROXY_CONFIG) return true;
-    console.log('[代理] 正在验证代理连接...');
-    try {
-        const axiosConfig = {
-            proxy: {
-                protocol: 'http',
-                host: new URL(PROXY_CONFIG.server).hostname,
-                port: parseInt(new URL(PROXY_CONFIG.server).port, 10),
-            },
-            timeout: 10000
-        };
-        if (PROXY_CONFIG.username && PROXY_CONFIG.password) {
-            axiosConfig.proxy.auth = {
-                username: PROXY_CONFIG.username,
-                password: PROXY_CONFIG.password
-            };
-        }
-        await axios.get('https://1.1.1.1', axiosConfig);
-        console.log('[代理] 连接成功！');
-        return true;
-    } catch (error) {
-        console.error(`[代理] 连接失败: ${error.message}`);
-        return false;
-    }
-}
 
 function checkPort(port) {
     return new Promise((resolve) => {
@@ -945,7 +917,7 @@ function parseS5TextToMihomoProxies(rawText) {
             continue;
         }
 
-        // 1. Telegram Socks 格式: https://t.me/socks?server=...&port=...&user=...&pass=...
+        // 1. Telegram Socks 格式
         if (/^(https?:\/\/t\.me\/socks\?|tg:\/\/socks\?)/i.test(line)) {
             try {
                 const urlObj = new URL(line.replace(/^tg:\/\/socks\?/i, 'https://dummy.com/socks?'));
@@ -973,7 +945,7 @@ function parseS5TextToMihomoProxies(rawText) {
             } catch (e) { }
         }
 
-        // 2. 标准 socks5:// 协议格式: socks5://user:pass@server:port
+        // 2. 标准 socks5:// 协议格式
         if (/^socks5?:\/\//i.test(line)) {
             try {
                 const urlObj = new URL(line);
@@ -1000,7 +972,7 @@ function parseS5TextToMihomoProxies(rawText) {
             } catch (e) { }
         }
 
-        // 3. HTTP 格式 (支持附带 | 备注): http://114.37.235.105:443 | 家宽直连
+        // 3. HTTP 格式 (支持附带 | 备注)
         if (/^https?:\/\//i.test(line)) {
             try {
                 let remark = '';
@@ -1098,7 +1070,7 @@ function startMihomoProcess(mihomoPath) {
     return true;
 }
 
-// 智能代理统一解析与部署核心（自动嗅探 Clash YAML订阅、Base64节点、TG Socks、HTTP、S5文本）
+// 智能代理统一解析与部署核心
 async function setupSmartProxyPool(proxySource) {
     if (!proxySource) return { pool: [], stats: { total: 0, healthy: 0, invalid: 0, source: 'NONE', invalidNodes: [] } };
 
@@ -1123,7 +1095,6 @@ async function setupSmartProxyPool(proxySource) {
             rawContent = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
             console.log(`[智能代理] 成功获取远程内容，长度: ${rawContent.length} 字符`);
 
-            // 嗅探1：是否为 Clash YAML 订阅内容
             if (rawContent.includes('proxies:') || rawContent.includes('proxy-providers:') || (rawContent.includes('port:') && rawContent.includes('rules:'))) {
                 isClashYaml = true;
             }
@@ -1317,7 +1288,6 @@ async function testMihomoProxies(proxyNames) {
             if (r) healthyWithDelay.push(r);
         }
     }
-    // 按延迟升序排序，优先使用速度更优的节点
     healthyWithDelay.sort((a, b) => a.delay - b.delay);
     const healthy = healthyWithDelay.map(item => item.name);
     console.log(`[代理池] 🏁 测速检查完成: 总计 ${proxyNames.length} 个, 存活有效 ${healthy.length} 个, 失效 ${invalidNodes.length} 个\n`);
@@ -1464,7 +1434,7 @@ async function switchMihomoProxy(name) {
                 await page.addInitScript(INJECTED_SCRIPT);
 
                 console.log('正在访问登录页...');
-                await page.goto('https://dashboard.katabump.com/auth/login');
+                await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'domcontentloaded' });
                 await page.waitForTimeout(2000);
 
                 const loginTurnstileOk = await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
@@ -1483,17 +1453,33 @@ async function switchMihomoProxy(name) {
                 await pwdInput.fill(user.password);
 
                 await page.waitForTimeout(500);
+
+                // 点击登录前先建立导航监听，避免错过跳转
+                console.log('   >> 已点击 Login，等待登录跳转...');
+                const navPromise = page.waitForURL(
+                    url => !url.pathname.includes('/auth/login'),
+                    { timeout: 30000 }
+                ).then(() => true).catch(() => false);
+
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-                    if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ 登录失败: 账号或密码错误`);
-                        const failPhotoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-                        const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
-                        try { await saveViewportScreenshot(page, failScreenshot); } catch (e) { }
+                const loginNavigated = await navPromise;
+
+                // 给 cookie / 重定向留稳定时间
+                await page.waitForTimeout(1500);
+
+                // 若仍停留在登录页，说明登录未成功
+                if (page.url().includes('/auth/login')) {
+                    const wrongPwdVisible = await page.getByText('Incorrect password or no account').isVisible().catch(() => false);
+                    console.log(`   >> ❌ 登录后仍在登录页 (navigated=${loginNavigated}, wrongPwd=${wrongPwdVisible})`);
+
+                    const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                    const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                    const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
+                    try { await saveViewportScreenshot(page, failScreenshot); } catch (e) { }
+
+                    if (wrongPwdVisible) {
                         await sendTelegramMessage(`❌ *[@s5gydl] ${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
                         stats.failed++;
                         stats.failedAccounts.push(user.username);
@@ -1503,14 +1489,19 @@ async function switchMihomoProxy(name) {
                             daysLeft: "未知",
                             node: usedNode
                         };
-                        accountSuccess = true; // Set true to break out of outer loop since password is wrong
+                        accountSuccess = true;
                         break;
+                    } else {
+                        accountFailureReason = "登录后未离开登录页（可能被 CF 拦截或节点问题）";
+                        continue; // 切换节点重试
                     }
-                } catch (e) { }
+                }
+
+                console.log(`   >> ✅ 登录成功，当前 URL: ${page.url()}`);
 
                 if (user.serverId) {
                     console.log(`正在通过 Server ID (${user.serverId}) 直接访问续期页面...`);
-                    await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`);
+                    await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { waitUntil: 'domcontentloaded' });
                     await page.waitForTimeout(3000);
                 } else {
                     console.log('未配置 Server ID，正在寻找 "See" 链接...');
@@ -1526,6 +1517,13 @@ async function switchMihomoProxy(name) {
                     }
                 }
 
+                // 进入服务器页后再次确认没有被踢回登录页
+                if (page.url().includes('/auth/login')) {
+                    console.log('   >> ❌ 访问服务器页被重定向回登录页，视为本次登录失效。');
+                    accountFailureReason = "进入服务器页被重定向回登录页";
+                    continue;
+                }
+
                 const photoDir = path.join(process.cwd(), 'screenshots');
                 if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                 const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
@@ -1537,7 +1535,6 @@ async function switchMihomoProxy(name) {
 
                 if (pageActualExpiry) {
                     console.log(`[日期检查] 页面当前实际到期时间: ${pageActualExpiry}`);
-                    // 如果本地记录与页面不一致，重新写入本地文件
                     if (renewDates[dedupeKey] !== pageActualExpiry) {
                         console.log(`[日期矫正] 账号 ${user.username}: 本地记录 (${renewDates[dedupeKey] || '空'}) 与页面实际 (${pageActualExpiry}) 不一致，重新写入本地文件！`);
                         renewDates[dedupeKey] = pageActualExpiry;
@@ -1617,14 +1614,12 @@ async function switchMihomoProxy(name) {
                             console.log('   >> 点击弹窗中的 Renew 确认按钮...');
                             await confirmBtn.click({ force: true }).catch(() => confirmBtn.click());
 
-                            // 等待服务端处理及页面响应
                             console.log('   >> 等待页面反馈...');
                             await page.waitForTimeout(2500);
 
-                            // 点击后立即检查页面状态 (包括主页面及弹窗中的提示)
                             let afterClickStatus = await extractServerStatus(page);
 
-                            // A. 检查是否提示未到期 (例如后端抛出红色警告条)
+                            // A. 检查是否提示未到期
                             if (afterClickStatus.isNotTimeToRenew || (await page.getByText("You can't renew your server yet").isVisible().catch(() => false))) {
                                 let curExpiry = afterClickStatus.actualExpiry || pageActualExpiry;
                                 let daysLeft = parseExpiryDate(curExpiry) || '未知';
@@ -1661,29 +1656,28 @@ async function switchMihomoProxy(name) {
                             // B. 检查是否有验证码报错
                             if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
                                 console.log('   >> ⚠️ 提示需要验证码，刷新页面重试...');
-                                await page.reload();
+                                await page.reload({ waitUntil: 'domcontentloaded' });
                                 await page.waitForTimeout(3000);
                                 if (page.url().includes('login')) break;
                                 continue;
                             }
 
-                            // C. 弹窗关闭后的最终验证 (刷新页面比对日期与横幅)
+                            // C. 弹窗关闭后的最终验证
                             if (!await modal.isVisible()) {
                                 console.log('   >> 弹窗已关闭，正在刷新页面获取最新状态...');
                                 await page.waitForTimeout(2000);
                                 try {
-                                    await page.reload({ timeout: 10000 });
+                                    await page.reload({ timeout: 10000, waitUntil: 'domcontentloaded' });
                                     await page.waitForTimeout(2000);
                                 } catch (reloadErr) {
                                     if (user.serverId) {
-                                        await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { timeout: 15000 }).catch(() => { });
+                                        await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`, { timeout: 15000, waitUntil: 'domcontentloaded' }).catch(() => { });
                                         await page.waitForTimeout(2000);
                                     }
                                 }
 
                                 const refreshedStatus = await extractServerStatus(page);
 
-                                // 再次确认刷新后是否有未到期红条
                                 if (refreshedStatus.isNotTimeToRenew) {
                                     let curExpiry = refreshedStatus.actualExpiry || pageActualExpiry;
                                     let daysLeft = parseExpiryDate(curExpiry) || '未知';
@@ -1714,7 +1708,6 @@ async function switchMihomoProxy(name) {
                                     break;
                                 }
 
-                                // 检查日期是否真正发生了更新 (延期)
                                 const newExpiry = refreshedStatus.actualExpiry;
                                 const isDateExtended = newExpiry && pageActualExpiry && (newExpiry !== pageActualExpiry);
 
@@ -1742,7 +1735,6 @@ async function switchMihomoProxy(name) {
                                     renewPhaseSuccess = true;
                                     break;
                                 } else {
-                                    // 日期未变且无红条：判定为当前正常、校正日期
                                     let curExpiry = newExpiry || pageActualExpiry || '已校正';
                                     let daysLeft = parseExpiryDate(curExpiry) || '未知';
                                     console.log(`   >> 🔄 日期无需更新或未发生变动 (${curExpiry})，完成校对并同步本地文件`);
@@ -1771,13 +1763,13 @@ async function switchMihomoProxy(name) {
                                 }
                             } else {
                                 console.log('   >> 模态框未关闭，刷新重试...');
-                                await page.reload();
+                                await page.reload({ waitUntil: 'domcontentloaded' });
                                 await page.waitForTimeout(3000);
                                 if (page.url().includes('login')) break;
                                 continue;
                             }
                         } else {
-                            await page.reload();
+                            await page.reload({ waitUntil: 'domcontentloaded' });
                             await page.waitForTimeout(3000);
                             if (page.url().includes('login')) break;
                             continue;
@@ -1813,7 +1805,6 @@ async function switchMihomoProxy(name) {
                     break;
                 } else {
                     accountFailureReason = `续期操作未成功完成`;
-                    // Let the account retry loop continue and switch node
                 }
 
             } catch (err) {
